@@ -1,9 +1,10 @@
-﻿#define DEBUG_LEVEL_1
+﻿// #define DEBUG_LEVEL_1
 // #define DEBUG_LEVEL_2
 // #define DEBUG_LEVEL_3
 
 using System;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using ChessChallenge.API;
 using Microsoft.CodeAnalysis;
@@ -201,51 +202,46 @@ public class MyBot : IChessBot
             foreach(string testFEN in testFENs)
             {
                 testBoard.LoadPosition(testFEN);
-                Console.WriteLine(
-                    ("Eval of Test FEN (" + testFEN + "):").PadRight(90) +
-                    Evaluate(new Board(testBoard)));
+                // Console.WriteLine(
+                //     ("Eval of Test FEN (" + testFEN + "):").PadRight(90) +
+                //     Evaluate(new Board(testBoard)));
             }
         }
     #endif
 
-    public Move Think(Board board, Timer timer)
-    {
-        Move[] moves = board.GetLegalMoves();
+    int max_depth = 10;
+    int eval_top_moves = 2;
 
-        double[] evaluations = new double[moves.Length];
-
-        // evaluate each move
-        for (int i = 0; i < moves.Length; i++)
-        {
-            #if DEBUG_LEVEL_1
-                Console.WriteLine("\n-----------------------\n" + moves[i].ToString());
-            #endif
-
-            // make move
-            board.MakeMove(moves[i]);
-
-            // evaluate board
-            evaluations[i] = Evaluate(board);
-
-            #if DEBUG_LEVEL_1
-                Console.WriteLine("\nEval: " + evaluations[i]);
-            #endif
-
-            // undo move
-            board.UndoMove(moves[i]);
-        }
-
-        // find best move
-        return moves[evaluations.ToList().IndexOf(evaluations.Max())];
+    public Move Think(Board board, Timer timer) {
+        myBoard = board;
+        return Search(0).Item2;
     }
 
-    private unsafe double Evaluate(Board board)
+    public Board myBoard;
+
+    public (double, Move) Search(int depth) => myBoard.GetLegalMoves()
+        .Select(m => (Evaluate_Move(m), m))
+        .OrderByDescending(e_m => e_m.Item1)
+        .Take(eval_top_moves)
+        .Select(e_m => {
+            if(depth == max_depth) return e_m;
+            myBoard.MakeMove(e_m.m);
+            var search_result = (Search(depth + 1).Item1, e_m.m);
+            myBoard.UndoMove(e_m.m);
+            return search_result;
+        })
+        .MaxBy(e_m => e_m.Item1);
+
+    private unsafe double Evaluate_Move(Move move)
     {
+        // make move
+        myBoard.MakeMove(move);
+
         // load board state
-        ulong[] boardState = board.GetAllPieceLists().Select(pieceList =>
-            board.GetPieceBitboard(
+        ulong[] boardState = myBoard.GetAllPieceLists().Select(pieceList =>
+            myBoard.GetPieceBitboard(
                 pieceList.TypeOfPieceInList,
-                pieceList.IsWhitePieceList ^ board.IsWhiteToMove // invert board if bot plays black (white to move)
+                pieceList.IsWhitePieceList ^ myBoard.IsWhiteToMove // invert board if bot plays black (white to move)
             )
         ).ToArray();
 
@@ -264,7 +260,7 @@ public class MyBot : IChessBot
 
         #if DEBUG_LEVEL_2
             Console.WriteLine("\nBoard state:\n");
-            Console.WriteLine("FEN: " + board.GetFenString() + "\n");
+            Console.WriteLine("FEN: " + myBoard.GetFenString() + "\n");
             Console.WriteLine("Binary: ");
             for (int s = 0; s < 768; s++)
             {
@@ -336,6 +332,9 @@ public class MyBot : IChessBot
                 }
             }
         }
+
+        // undo move
+        myBoard.UndoMove(move);
 
         // return value of output neuron
         return neurons[^1];
