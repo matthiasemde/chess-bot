@@ -91,7 +91,8 @@ namespace WeightEncoder
 
                             // Every 16 bytes is a decimal
                             *decimal_p = *(decimal*)(weight_byte_p);
-                            Console.WriteLine(*decimal_p + "m,");
+                            Console.Write(*decimal_p + "m,");
+                            if(i % 4 == 3) Console.WriteLine();
 
                             // Increment pointers
                             weight_byte_p += 16;
