@@ -9,6 +9,7 @@ using System.IO;
 using System.Linq;
 using System.Collections.Generic;
 using ChessChallenge.API;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 
 public class MyBot : IChessBot
@@ -60,77 +61,92 @@ public class MyBot : IChessBot
             {
                 testBoard.LoadPosition(testFEN);
                 myBoard = new Board(testBoard);
-                Console.WriteLine(
-                    ("Eval of Test FEN (" + testFEN + "):").PadRight(90) +
-                    Evaluate().ToString().PadRight(10)
-                );
+                Evaluate();
+                // Console.WriteLine(
+                //     ("Eval of Test FEN (" + testFEN + "):").PadRight(90) +
+                //     Evaluate().ToString().PadRight(10)
+                // );
             }
+            // Console.WriteLine("\n");
         }
     #endif
 
     public Board myBoard;
 
     private class Node {
-        public Move move;
         public double prior;
         public double value_sum;
         public int visits;
-        public Node[]? children;
+        public (Move, Node)[]? children;
 
-        public Node(Move move, double prior, double value_sum, int visits, Node[]? children) {
-            this.move = move;
+        public Node(double prior, double value_sum, int visits, (Move, Node)[]? children) {
             this.prior = prior;
             this.value_sum = value_sum;
             this.visits = visits;
             this.children = children;
         }
 
-        #if DEBUG_LEVEL_1
+        #if DEBUG_LEVEL_0 || DEBUG_LEVEL_1
             public void Print(Board board, int parent_visits, int depth)
             {
-                if (depth > 1)
-                {
-                    return;
-                }
                 Console.WriteLine(
                     "Depth: " + depth.ToString().PadRight(2) +
-                    move.ToString() +
-                    " Prior: " + Math.Round(prior, 3).ToString().PadRight(8) +
-                    "Avg Value: " + Math.Round((visits > 0 ? value_sum / visits : 0), 4).ToString().PadRight(9) +
+                    "Prior: " + Math.Round(prior, 3).ToString().PadRight(8) +
+                    "Avg Value: " + Math.Round(visits > 0 ? value_sum / visits : 0, 4).ToString().PadRight(9) +
                     "Visits: " + visits.ToString().PadRight(3) + 
                     " => UCB: " + Math.Round(
                             (visits > 0 ? value_sum / visits : 0) +
                             prior * Math.Sqrt(parent_visits) / (visits + 1),
                         3
                     )
-
                 );
-                if (children != null)
+                if (children != null && depth < 1)
                 {
-                    foreach (Node child in children)
+                    foreach ((Move, Node) child in children)
                     {
-                        board.MakeMove(child.move);
-                        // Console.WriteLine("Board position:\n" +board.CreateDiagram()+ "\n");
-                        child.Print(board, visits, depth + 1);
-                        board.UndoMove(child.move);
+                        Console.Write("(" + child.Item1.ToString()[6..] + ") ");
+                        board.MakeMove(child.Item1);
+                        child.Item2.Print(board, visits, depth + 1);
+                        board.UndoMove(child.Item1);
                     }
                 }
             }
         #endif
     }
 
-
-    public Move Think(Board board, Timer timer) {
+    public unsafe Move Think(Board board, Timer timer) {
+        int transVisits = 0;
 
         myBoard = board;
 
-        Node[] expand()
+        var transpositionTable = new Dictionary<ulong, Node>();
+
+        (Move, Node)[] expand()
         {
             var e_ms = myBoard.GetLegalMoves().Select(m => (Evaluate_Move(m), m)).ToArray();
             double min = e_ms.Min(e_m => e_m.Item1) - 0.01;
             double sum = e_ms.Select(e_m => e_m.Item1 - min).Sum();
             return e_ms
-                .Select(e_m => new Node(e_m.m, (e_m.Item1 - min) / sum, 0.0, 0, null))
+                .Select(e_m => {
+                    myBoard.MakeMove(e_m.m);
+                    var key = myBoard.ZobristKey;
+                    if(transpositionTable.ContainsKey(key))
+                    {
+                        Node node = transpositionTable[key];
+                        #if DEBUG_LEVEL_0
+                            transVisits += node.visits;
+                        #endif
+                        myBoard.UndoMove(e_m.m);
+                        return (e_m.m, node);
+                    }
+                    else
+                    {
+                        var newNode = new Node((e_m.Item1 - min) / sum, 0.0, 0, null);
+                        transpositionTable.Add(key, newNode);
+                        myBoard.UndoMove(e_m.m);
+                        return (e_m.m, newNode);
+                    }
+                })
                 .ToArray();
         }
 
@@ -142,7 +158,8 @@ public class MyBot : IChessBot
                 Math.Sqrt(parent_visits) / (node.visits + 1)             
             );
 
-        Node root = new(new Move(), 1.0, 0.0, 0, null);
+        Node root = new(1.0, 0.0, 0, null);
+        transpositionTable.Add(myBoard.ZobristKey, root);
 
         #if DEBUG_LEVEL_0 || DEBUG_LEVEL_1
             int rollouts = 1;
@@ -151,55 +168,66 @@ public class MyBot : IChessBot
         while(timer.MillisecondsElapsedThisTurn < timer.MillisecondsRemaining * 0.05)
         {
             Node node = root;
-            List<Node> path = new() { node };
+            List<(Move, Node)> path = new() { (new Move(), node) };
 
             // selection
-            while (node.visits > 0 && node.children != null)
+            while (node.visits > 0 && node.children?.Where(c => !path.Contains(c)).Count() > 0)
             {
-                node = node.children.MaxBy(c => UCB(c, node.visits));
-                myBoard.MakeMove(node.move);
-                path.Add(node);
+                (var move, node) = node.children.Where(c => !path.Contains(c)).MaxBy(c => UCB(c.Item2, node.visits));
+                myBoard.MakeMove(move);
+                path.Add((move, node));
             }
 
             // expansion
-            if (board.GetLegalMoves().Length > 0)
+            if (myBoard.GetLegalMoves().Length > 0)
             {
+                #if DEBUG_LEVEL_1
+                    Console.WriteLine("Expanding Position:\n"+ myBoard.CreateDiagram() + "("+node.visits+")");
+                #endif
                 node.children = expand();
-                node = node.children.MaxBy(c => UCB(c, node.visits));
-                myBoard.MakeMove(node.move);
-                path.Add(node);
+                #if DEBUG_LEVEL_1
+                    Console.Write("New Children: ");
+                    foreach ((Move, Node) child in node.children)
+                    {
+                        Console.Write(child.Item1.ToString().Substring(5) + ", ");
+                    }
+                    Console.WriteLine("\n");
+                #endif
+                (var move, node) = node.children.MaxBy(c => UCB(c.Item2, node.visits));
+                myBoard.MakeMove(move);
+                path.Add((move, node));
             }
 
             // backpropagation
-            double value = board.IsDraw()
+            double value = myBoard.IsDraw()
                 ? 0.0
-                : board.IsInCheckmate()
+                : myBoard.IsInCheckmate()
                     ? 1.0
                     : Evaluate();
 
-            for (int i = path.Count - 1; i > 0; --i)
+            for (int i = path.Count - 1; i >= 0; --i)
             {
-                path[i].value_sum += value;
-                path[i].visits++;
-                board.UndoMove(path[i].move);
+                #if DEBUG_LEVEL_1
+                    Console.WriteLine("Backpropagating: " + path[i].Item1.ToString().Substring(5) + " " + value);
+                #endif
+                path[i].Item2.value_sum += value;
+                path[i].Item2.visits++;
+                board.UndoMove(path[i].Item1);
                 value *= -1;
             }
-
-            root.visits++;
 
             #if DEBUG_LEVEL_0 || DEBUG_LEVEL_1
                 rollouts++;
             #endif
         }
-
-        #if DEBUG_LEVEL_1
-            root.Print(myBoard, 0, 0);
-        #endif
         #if DEBUG_LEVEL_0 || DEBUG_LEVEL_1
-            Console.WriteLine("\nRollouts: " + rollouts);
+            Console.Write("\n\nSearch Tree after "+rollouts+" rollouts:\n('Root') ");
+            root.Print(myBoard, 0, 0);
+            Console.WriteLine();
+            Console.WriteLine("\nRollouts: " + rollouts + "\nRollouts saved by transposition table: " + transVisits + "\nTransposition table size: " + transpositionTable.Count);
         #endif
 
-        return root.children.MaxBy(c => c.visits).move;
+        return root.children.MaxBy(c => c.Item2.visits).Item1;
     }
 
     private unsafe double Evaluate_Move(Move move)
@@ -218,18 +246,9 @@ public class MyBot : IChessBot
 
     private unsafe double Evaluate()
     {
-
-        // load board state
-        ulong[] boardState = myBoard.GetAllPieceLists().Select(pieceList =>
-            myBoard.GetPieceBitboard(
-                pieceList.TypeOfPieceInList,
-                pieceList.IsWhitePieceList ^ myBoard.IsWhiteToMove // invert board if bot plays black (white to move)
-            )
-        ).ToArray();
-
         // create network
         int[] layers = {768, 1}; // optimize later
-        double[] neurons = new double[1]; // optimize later
+        double[] neurons = new double[200+1]; // optimize later
 
         #if DEBUG_LEVEL_1
             int networkConnections = 0;
@@ -257,11 +276,74 @@ public class MyBot : IChessBot
             Console.WriteLine("\nNeurons:\n");
         #endif
 
+        int distToMid(int index) => (int)Math.Abs(index - 3.5);
+
         fixed (double * neuron_po = neurons)
         {
+            double * input_p = neuron_po;
+
+            // construct state vector
+            // starting with the pieces 
+            foreach(PieceList pieceList in myBoard.GetAllPieceLists()) {
+                foreach(Piece piece in pieceList) {
+                    *(input_p +
+                        pieceList.TypeOfPieceInList switch {
+                            PieceType.Pawn => (
+                                pieceList.IsWhitePieceList
+                                    ? piece.Square.Rank - 1
+                                    : 6 - piece.Square.Rank
+                            ) * 4 + distToMid(piece.Square.File),
+                            PieceType.Knight =>  distToMid(piece.Square.Rank) + distToMid(piece.Square.File),
+                            _ => (
+                                pieceList.IsWhitePieceList
+                                    ? piece.Square.Rank
+                                    : 7 - piece.Square.Rank
+                            ) * 4 + distToMid(piece.Square.File)
+                        }
+                    ) += pieceList.IsWhitePieceList ^ myBoard.IsWhiteToMove ? 1 : -1;
+                }
+                input_p += pieceList.TypeOfPieceInList switch {
+                    PieceType.Pawn => 24,
+                    PieceType.Knight => 7,
+                    PieceType.King => -127,
+                    _ => 32
+                };
+            }
+
+            input_p += 159;
+
+            // Console.WriteLine(myBoard.CreateDiagram());
+
+            // then check whether the king is in check
+            *input_p++ = myBoard.IsInCheck() ? 1 : -1;
+
+            // check king attacks
+            foreach(PieceList pieceList in myBoard.GetAllPieceLists()) {
+                foreach(Piece piece in pieceList) {
+                    *(input_p + (pieceList.IsWhitePieceList ^ myBoard.IsWhiteToMove ? 1 : 0)) += BitboardHelper.GetNumberOfSetBits(
+                        BitboardHelper.GetPieceAttacks(
+                            pieceList.TypeOfPieceInList,
+                            piece.Square,
+                            myBoard,
+                            pieceList.IsWhitePieceList
+                        ) &
+                        (
+                            BitboardHelper.GetKingAttacks(myBoard.GetKingSquare(!pieceList.IsWhitePieceList)) |
+                            myBoard.GetPieceBitboard(PieceType.King, !pieceList.IsWhitePieceList)
+                        )
+                    );
+                }
+            }
+            input_p += 2;
+
+            for(int i = 0; i < 162; i++) {
+                Console.Write(Math.Round(neurons[i], 2));
+            }
+            Console.WriteLine();
+
+
             fixed(decimal * weight_po = weights)
             {
-                double * input_p = neuron_po;
                 double * output_p = neuron_po;
                 sbyte * weight_p = (sbyte *) weight_po;
 
@@ -271,6 +353,9 @@ public class MyBot : IChessBot
                     // loop through neurons
                     for(int n = 0; n < layers[l]; n++)
                     {
+                        // reset input pointer
+                        input_p -= layers[l-1];
+
                         // loop through inputs
                         for(int i = 0; i <= layers[l - 1]; i++)
                         {
@@ -278,25 +363,13 @@ public class MyBot : IChessBot
                             if ((weight_p - (sbyte*) weight_po) % 16 == 0) weight_p += 4;
 
                             // compute weighted sum
-                            *output_p +=
-                                (i == layers[l - 1]
-                                    ? 1
-                                    : l == 1
-                                        ? (boardState[i / 64] >> (i % 64) & 1) // for the first layer, use the board state as input
-                                        : *input_p++
-                                ) *
-                                (((double) *weight_p++) / scaling_factor + shift); // decode sbyte [-128, 127] to double [-2.0, 2.0]
+                            *output_p += *input_p++ * (((double) *weight_p++) / scaling_factor + shift); // decode sbyte [-128, 127] to double [-2.0, 2.0]
 
                             #if DEBUG_LEVEL_3
                                 input_p--; weight_p--; // undo increment temporarily
-                                double input =
-                                    i == layers[l - 1]
-                                        ? 1
-                                        : l == 1
-                                            ? (boardState[i / 64] >> (i % 64) & 1)
-                                            : *input_p;
+                                double input = i == layers[l - 1] ? 1 : *input_p;
                                 Console.WriteLine(
-                                    Math.Round(input, 2).ToString().PadRight(8) + "("+ (l == 1 ? i : input_p - neuron_po) +") * " +
+                                    Math.Round(input, 2).ToString().PadRight(8) + "("+ (input_p - neuron_po) +") * " +
                                     Math.Round(((double) *weight_p) / scaling_factor + shift, 2).ToString().PadRight(8) + "(" + (weight_p - (sbyte*) weight_po) + ") -> " +
                                     Math.Round(*output_p, 2).ToString().PadRight(8) + "(" + (output_p - neuron_po) + ")"
                                 );
@@ -305,11 +378,7 @@ public class MyBot : IChessBot
                         }
 
                         // apply ReLU activation function except for the last layer
-                        *output_p *= Convert.ToDouble(*output_p > 0 || l == layers.Length - 1);
-
-                        // increment/reset pointers
-                        output_p++;
-                        input_p -= l > 1 ? layers[l - 1] : 0;
+                        *output_p++ *= Convert.ToDouble(*output_p > 0 || l == layers.Length - 1);
                     }
                 }
             }
